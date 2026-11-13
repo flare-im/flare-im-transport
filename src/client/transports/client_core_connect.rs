@@ -260,7 +260,8 @@ impl ClientCore {
     fn check_conflict_connections(cmd: &crate::common::protocol::SystemCommand) {
         if let Some(conflicts_bytes) = cmd.metadata.get("conflict_connections")
             && let Ok(conflicts_json) = String::from_utf8(conflicts_bytes.clone())
-            && let Ok(conflict_connections) = serde_json::from_str::<Vec<String>>(&conflicts_json)
+            && let Ok(conflict_connections) =
+                serde_json::from_slice::<Vec<String>>(conflicts_json.as_bytes())
             && !conflict_connections.is_empty()
         {
             tracing::warn!(

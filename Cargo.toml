@@ -53,12 +53,16 @@ hex = "0.4"
 base32 = "0.4"
 aes-gcm = { version = "0.10", optional = true }
 rand = "0.8"
-anyhow = "1.0"
+# Without `std` here: the browser build cannot capture a backtrace anyway, and anyhow's `std`
+# feature would still link the backtrace printer and symbol demangler into the WASM bundle.
+# Native builds turn `std` back on below.
+anyhow = { version = "1.0", default-features = false }
 
 [build-dependencies]
 prost-build = "0.14"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+anyhow = "1.0"
 # rustls-pemfile 已停止维护（RUSTSEC-2025-0134，无修复版本），
 # PEM 解析改用其继任者 rustls-pki-types（rustls 的公共类型层，本就在依赖树里）。
 rustls-pki-types = { version = "1", features = ["std"] }
