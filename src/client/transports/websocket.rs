@@ -164,12 +164,16 @@ impl WebSocketClient {
         ws_config: tungstenite::protocol::WebSocketConfig,
         tls_connector: Option<Connector>,
     ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        use crate::client::dial;
+        use tokio::time::Instant;
+
         let request = url
             .into_client_request()
             .map_err(|e| FlareError::connection_failed(e.to_string()))?;
         let (host, port) = dial_endpoint(&request)?;
+        let deadline = Instant::now() + self.config.connect_timeout;
         let dial = async {
-            let stream = crate::client::dial::connect_tcp(
+            let addresses = dial::resolve(
                 &host,
                 port,
                 &self.config.ip_hints,
@@ -180,23 +184,42 @@ impl WebSocketClient {
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::TimedOut => FlareError::connection_timeout(e.to_string()),
                 _ => FlareError::connection_failed(e.to_string()),
-            })?;
-            let (ws_stream, _) =
-                client_async_tls_with_config(request, stream, Some(ws_config), tls_connector)
+            })?
+            .addresses;
+            let count = addresses.len().min(dial::MAX_HANDSHAKE_ADDRESSES);
+            let mut last = FlareError::connection_failed("No address to dial");
+            for (index, address) in addresses.into_iter().take(count).enumerate() {
+                let attempt = async {
+                    let stream = TcpStream::connect(address).await?;
+                    client_async_tls_with_config(
+                        url,
+                        stream,
+                        Some(ws_config),
+                        tls_connector.clone(),
+                    )
                     .await
-                    .map_err(|e| {
-                        let error = FlareError::connection_failed(e.to_string());
+                };
+                match timeout(dial::share_of(deadline, count - index), attempt).await {
+                    Ok(Ok((stream, _))) => return Ok(stream),
+                    // An HTTP response means the endpoint received the upgrade.
+                    Ok(Err(error @ tungstenite::Error::Http(_))) => {
+                        return Err(FlareError::connection_failed(error.to_string()));
+                    }
+                    Ok(Err(error)) => {
+                        last = FlareError::connection_failed(error.to_string());
                         if let Some(doh) = &self.config.doh
                             && matches!(
-                                AttemptFailure::from_establish_error(&error),
+                                AttemptFailure::from_establish_error(&last),
                                 AttemptFailure::Tls { .. }
                             )
                         {
                             doh.tls_failed(&host);
                         }
-                        error
-                    })?;
-            Ok(ws_stream)
+                    }
+                    Err(_) => last = FlareError::connection_timeout("Connection timeout"),
+                }
+            }
+            Err(last)
         };
         crate::client::dial::watch_dial(
             &host,
@@ -324,6 +347,74 @@ mod tests {
     use super::*;
     use crate::common::config_types::TlsConfig;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn wss_falls_back_after_the_first_address_breaks_tls() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let host = "im-gateway.invalid";
+        let cert = rcgen::generate_simple_self_signed(vec![host.to_owned()]).unwrap();
+        let server_tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
+        )
+        .unwrap();
+        let good = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = good.local_addr().unwrap().port();
+        let bad = TcpListener::bind(("::1", port)).await.unwrap();
+        let bad_attempt = tokio::spawn(async move {
+            let (mut stream, _) = timeout(Duration::from_secs(4), bad.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.0 503 Service Unavailable\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let good_attempt = tokio::spawn(async move {
+            let (stream, _) = timeout(Duration::from_secs(4), good.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let stream = stream.into_std().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            tokio::task::spawn_blocking(move || {
+                let session = rustls::ServerConnection::new(Arc::new(server_tls)).unwrap();
+                let socket =
+                    tungstenite::accept(rustls::StreamOwned::new(session, stream)).unwrap();
+                assert_eq!(socket.get_ref().conn.server_name(), Some(host));
+            })
+            .await
+            .unwrap();
+        });
+        let client_tls = TlsConfig {
+            ca_cert_data: Some(cert.cert.der().to_vec()),
+            ..TlsConfig::default()
+        };
+        let config = ClientConfig::new(format!("wss://{host}:{port}/ws"))
+            .websocket()
+            .with_connect_timeout(Duration::from_secs(4))
+            .with_ip_hints(vec!["::1".parse().unwrap(), "127.0.0.1".parse().unwrap()])
+            .with_tls(client_tls);
+        WebSocketClient::new(config).establish().await.unwrap();
+        bad_attempt.await.unwrap();
+        good_attempt.await.unwrap();
+    }
 
     /// 客户端不自己重连：断开后的发送直接失败，不去拨号。
     #[tokio::test]

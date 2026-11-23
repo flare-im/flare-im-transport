@@ -201,19 +201,17 @@ impl QUICClient {
                 let limit = dial::share_of(deadline, addresses.len() - index);
                 match Self::connect_address(endpoint, *address, &hostname, limit).await {
                     Ok(connection) => return Ok(connection),
-                    // 证书或钉扎不符：换 IP 也是同一张证书
-                    Err(error)
-                        if matches!(
-                            AttemptFailure::from_establish_error(&error),
-                            AttemptFailure::Tls { .. }
-                        ) =>
-                    {
-                        if let Some(doh) = &self.config.doh {
+                    Err(error) => {
+                        if let Some(doh) = &self.config.doh
+                            && matches!(
+                                AttemptFailure::from_establish_error(&error),
+                                AttemptFailure::Tls { .. }
+                            )
+                        {
                             doh.tls_failed(&hostname);
                         }
-                        return Err(error);
+                        last_error = Some(error);
                     }
-                    Err(error) => last_error = Some(error),
                 }
             }
             Err(last_error
@@ -283,7 +281,7 @@ impl QUICClient {
         Ok((addresses, hostname))
     }
 
-    /// DNS 解析 `host:port`：成功时只用第一个结果，失败时退到 IP 提示
+    /// DNS 解析 `host:port`：在统一建连时限内按顺序尝试解析结果或 IP 提示。
     async fn resolve_host(&self, address_str: &str) -> Result<Vec<SocketAddr>> {
         let (host, port) = address_str
             .rsplit_once(':')
@@ -302,9 +300,7 @@ impl QUICClient {
         )
         .await
         .map_err(|e| FlareError::protocol_error(format!("DNS lookup failed: {}", e)))?;
-        if !chosen.direct {
-            chosen.addresses.truncate(1);
-        }
+        chosen.addresses.truncate(dial::MAX_HANDSHAKE_ADDRESSES);
         Ok(chosen.addresses)
     }
 

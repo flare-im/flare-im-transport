@@ -2,9 +2,12 @@
 //!
 //! 只做建连（TLS 握手 + 协商），用来区分三种失败：
 //! UDP 不通（超时）、证书不被信任（invalid peer certificate）、服务端拒绝。
+//! 已启用鉴权的网关可通过 FLARE_QUIC_PROBE_TOKEN 和 FLARE_QUIC_PROBE_DEVICE_ID
+//! 提供测试账号的 IM 连接令牌及签发时使用的设备 ID。
 use flare_core::client::HybridClient;
 use flare_core::client::{Client, ClientConfig};
 use flare_core::common::config_types::TlsConfig;
+use flare_core::common::device::{DeviceInfo, DevicePlatform};
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -15,6 +18,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "quic://127.0.0.1:60052".to_string());
     let ca = args.next();
     let mut config = ClientConfig::new(url.clone()).quic();
+    if let Some(token) = std::env::var_os("FLARE_QUIC_PROBE_TOKEN") {
+        let token = token
+            .into_string()
+            .map_err(|_| "invalid probe token encoding")?;
+        let device = std::env::var("FLARE_QUIC_PROBE_DEVICE_ID")?;
+        if token.is_empty() || device.is_empty() {
+            return Err("probe token and device id must be nonempty".into());
+        }
+        config = config
+            .with_token(token)
+            .with_device_info(DeviceInfo::new(device, DevicePlatform::PC));
+    }
     if let Some(ca) = ca {
         config.tls = TlsConfig::none().with_ca_cert(PathBuf::from(ca));
     }

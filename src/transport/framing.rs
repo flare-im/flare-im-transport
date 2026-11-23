@@ -111,4 +111,32 @@ mod tests {
             ConnectionEvent::Disconnected(_)
         ));
     }
+    #[tokio::test]
+    async fn protobuf_roundtrips_across_fragmented_and_adjacent_transport_frames() {
+        use crate::common::{
+            protocol::Frame,
+            serializer::{ProtobufSerializer, Serializer},
+        };
+        let expected: Vec<_> = ["x", "next"]
+            .into_iter()
+            .map(|id| Frame {
+                message_id: id.into(),
+                ..Default::default()
+            })
+            .collect();
+        let sent = expected.clone();
+        let (mut writer, mut reader) = tokio::io::duplex(2);
+        let task = tokio::spawn(async move {
+            for frame in sent {
+                let bytes = ProtobufSerializer.serialize(&frame).unwrap();
+                write_length_prefixed(&mut writer, &bytes).await.unwrap();
+            }
+        });
+        for frame in expected {
+            let bytes = read_length_prefixed(&mut reader).await.unwrap();
+            assert_eq!(ProtobufSerializer.deserialize(&bytes).unwrap(), frame);
+        }
+        task.await.unwrap();
+        assert!(read_length_prefixed(&mut reader).await.unwrap().is_empty());
+    }
 }

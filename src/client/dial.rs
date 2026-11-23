@@ -8,7 +8,7 @@
 //! 这个主机时查到的公网地址排最前，然后是公网提示、解析结果。当次拨号不等它。
 //!
 //! 这里只决定「连哪个 IP」。主机名不变，所以 TLS SNI 与证书校验仍按主机名，SPKI 钉扎照常生效，
-//! 提示和 DoH 都不增加信任。解析成功但连不上不算 DNS 失败：不换 IP，由上层换接入点。
+//! 提示和 DoH 都不增加信任。连接阶段可在同一主机的解析结果中换地址，再由上层换接入点。
 //!
 //! 浏览器不能指定 IP，这个模块只在原生端编译。
 
@@ -19,8 +19,6 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "websocket")]
-use tokio::net::TcpStream;
 use tokio::net::lookup_host;
 #[cfg(any(feature = "websocket", feature = "quic"))]
 use tokio::time::Instant;
@@ -32,6 +30,9 @@ pub use doh::{DohAnswer, DohCache, DohLookup, MAX_DOH_TTL, MIN_DOH_TTL};
 
 /// 改用提示或 DoH 地址时，每一种最多试几个 IP。
 pub const MAX_DIRECT_ADDRESSES: usize = 2;
+
+/// Maximum socket addresses tried for one hostname within a handshake budget.
+pub const MAX_HANDSHAKE_ADDRESSES: usize = 4;
 
 /// 有 IP 可退时，DNS 最多占建连时限的多少。DNS 不应答时系统解析器往往要等到建连时限之后才报错，
 /// 不设限就永远轮不到 IP。
@@ -205,32 +206,6 @@ pub(crate) async fn watch_dial<F: Future>(
             dial.await
         }
     }
-}
-
-/// 建一条 TCP 连接。解析结果按顺序逐个试；IP 提示每个分一份时限。
-#[cfg(feature = "websocket")]
-pub(crate) async fn connect_tcp(
-    host: &str,
-    port: u16,
-    ip_hints: &[IpAddr],
-    doh: Option<&Arc<DohCache>>,
-    connect_timeout: Duration,
-) -> io::Result<TcpStream> {
-    let deadline = Instant::now() + connect_timeout;
-    let chosen = resolve(host, port, ip_hints, doh, connect_timeout).await?;
-    if !chosen.direct {
-        return TcpStream::connect(chosen.addresses.as_slice()).await;
-    }
-    let mut last_error = io::Error::from(io::ErrorKind::TimedOut);
-    for (index, address) in chosen.addresses.iter().enumerate() {
-        let share = share_of(deadline, chosen.addresses.len() - index);
-        match timeout(share, TcpStream::connect(*address)).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(error)) => last_error = error,
-            Err(_) => last_error = io::ErrorKind::TimedOut.into(),
-        }
-    }
-    Err(last_error)
 }
 
 #[cfg(test)]
@@ -627,34 +602,5 @@ mod tests {
     #[test]
     fn dns_gets_half_of_the_connect_timeout() {
         assert_eq!(dns_limit(Duration::from_secs(8)), Duration::from_secs(4));
-    }
-
-    #[cfg(feature = "websocket")]
-    #[tokio::test]
-    async fn connect_tcp_moves_on_from_a_refused_hint() {
-        // 同一端口只有 127.0.0.1 在听：第一个提示是 IPv6 回环，连不上就试下一个。
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let hints = [ip("::1"), ip("127.0.0.1")];
-        let (stream, accepted) = tokio::join!(
-            connect_tcp("ap-1.invalid", port, &hints, None, LIMIT),
-            listener.accept()
-        );
-        assert_eq!(stream.unwrap().peer_addr().unwrap().port(), port);
-        accepted.unwrap();
-    }
-
-    #[cfg(feature = "websocket")]
-    #[tokio::test]
-    async fn connect_tcp_reports_the_last_failure_when_every_hint_fails() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let error = connect_tcp("ap-1.invalid", port, &[ip("127.0.0.1")], None, LIMIT)
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
     }
 }
