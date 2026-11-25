@@ -32,6 +32,11 @@ struct ConnectionState {
 /// 是最难查的一类故障。
 const INBOUND_QUEUE_CAPACITY: usize = 1024;
 
+struct InboundFrame {
+    bytes: Vec<u8>,
+    queued_at: Option<std::time::Instant>,
+}
+
 pub struct ConnectionHandlerObserverAdapter {
     /// 内部的 ConnectionHandler（ServerMessageWrapper）
     handler: Arc<ServerMessageWrapper>,
@@ -47,7 +52,7 @@ pub struct ConnectionHandlerObserverAdapter {
     /// 改成「每连接一个队列 + 单消费任务」：连接内严格有序，连接之间照旧并行，
     /// 吞吐仍随连接数扩展。顺带把「每帧一个任务」降成「每连接一个任务」，
     /// 高频小包场景下调度开销更低。
-    inbound: tokio::sync::mpsc::Sender<Vec<u8>>,
+    inbound: tokio::sync::mpsc::Sender<InboundFrame>,
 }
 
 impl ConnectionHandlerObserverAdapter {
@@ -58,7 +63,7 @@ impl ConnectionHandlerObserverAdapter {
         connection_manager: Arc<ConnectionManager>,
         server_core: Option<Arc<crate::server::transports::server_core::ServerCore>>,
     ) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(INBOUND_QUEUE_CAPACITY);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundFrame>(INBOUND_QUEUE_CAPACITY);
 
         // 每连接一个消费任务，串行处理本连接的帧。
         // 适配器被丢弃时 tx 随之析构，rx.recv() 返回 None，任务自然退出。
@@ -68,10 +73,12 @@ impl ConnectionHandlerObserverAdapter {
             let server_core = server_core.clone();
             let conn_id: Arc<str> = Arc::from(connection_id.as_str());
             tokio::spawn(async move {
-                while let Some(data) = rx.recv().await {
+                while let Some(frame) = rx.recv().await {
+                    let queued = frame.queued_at.map(|at| at.elapsed());
                     Self::handle_message_event(
                         &handler,
-                        data,
+                        frame.bytes,
+                        queued,
                         Arc::clone(&conn_id),
                         Arc::clone(&manager),
                         server_core.clone(),
@@ -98,6 +105,7 @@ impl ConnectionHandlerObserverAdapter {
     async fn handle_message_event(
         handler: &Arc<ServerMessageWrapper>,
         data: Vec<u8>,
+        queue_wait: Option<std::time::Duration>,
         conn_id: Arc<str>,
         manager: Arc<ConnectionManager>,
         server_core: Option<Arc<crate::server::transports::server_core::ServerCore>>,
@@ -142,6 +150,7 @@ impl ConnectionHandlerObserverAdapter {
             Self::handle_negotiated_message(
                 handler,
                 data,
+                queue_wait,
                 conn_id,
                 manager,
                 connection_state.info,
@@ -198,6 +207,7 @@ impl ConnectionHandlerObserverAdapter {
     async fn handle_negotiated_message(
         handler: &Arc<ServerMessageWrapper>,
         data: Vec<u8>,
+        queue_wait: Option<std::time::Duration>,
         conn_id: Arc<str>,
         manager: Arc<ConnectionManager>,
         connection_info: crate::server::connection::ConnectionInfo,
@@ -305,6 +315,15 @@ impl ConnectionHandlerObserverAdapter {
                 return;
             }
         };
+
+        if let Some(wait) = queue_wait
+            && let Some(crate::common::protocol::flare::core::commands::command::Type::Payload(
+                payload,
+            )) = frame.command.as_ref().and_then(|cmd| cmd.r#type.as_ref())
+        {
+            tracing::trace!(target: "flare_core::inbound_queue", connection_id = %conn_id, frame_id = %payload.message_id,
+                queue_us = wait.as_micros() as u64, "inbound queue duration");
+        }
 
         // 3. 如果有 pipeline，执行中间件（before）和处理器（processor）
         // 注意：Pipeline 的处理器（processor）只用于额外的处理，不应该替代 handle_frame
@@ -503,7 +522,12 @@ impl ConnectionObserver for ConnectionHandlerObserverAdapter {
             ConnectionEvent::Message(data) => {
                 // 投递到本连接的有序队列，由单个消费任务按序处理。
                 // 这里不能 spawn：同一连接的帧一旦并行，序列号分配就会乱序。
-                if let Err(e) = self.inbound.try_send(data.to_vec()) {
+                let frame = InboundFrame {
+                    bytes: data.to_vec(),
+                    queued_at: tracing::enabled!(target: "flare_core::inbound_queue", tracing::Level::TRACE)
+                        .then(std::time::Instant::now),
+                };
+                if let Err(e) = self.inbound.try_send(frame) {
                     match e {
                         tokio::sync::mpsc::error::TrySendError::Full(_) => {
                             error!(
